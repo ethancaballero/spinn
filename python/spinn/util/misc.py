@@ -2,6 +2,27 @@ import numpy as np
 from collections import deque
 import os
 
+import time
+
+TIMER_SCOPE = []
+
+class Timer:
+    def __init__(self, name="timer"):
+        self.name = name
+
+    def __enter__(self):
+        global TIMER_SCOPE
+        TIMER_SCOPE.append(self.name)
+        self.start = time.clock()
+        return self
+
+    def __exit__(self, *args):
+        global TIMER_SCOPE
+        self.end = time.clock()
+        self.interval = self.end - self.start
+        print("[{}]: {}".format("][".join(TIMER_SCOPE), self.interval))
+        TIMER_SCOPE.pop()
+
 
 class GenericClass(object):
     def __init__(self, **kwargs):

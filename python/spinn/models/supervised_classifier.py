@@ -7,6 +7,8 @@ import sys
 import time
 from collections import deque
 
+from spinn.util.misc import Timer
+
 import gflags
 import numpy as np
 
@@ -173,74 +175,86 @@ def train_loop(FLAGS, data_manager, model, optimizer, trainer, training_data_ite
     progress_bar.step(i=0, total=FLAGS.statistics_interval_steps)
 
     for step in range(step, FLAGS.training_steps):
-        model.train()
+        with Timer("train"):
+            model.train()
 
-        start = time.time()
+            start = time.time()
 
-        batch = get_batch(training_data_iter.next())
-        X_batch, transitions_batch, y_batch, num_transitions_batch, train_ids = batch
+            with Timer("get_batch"):
+                batch = get_batch(training_data_iter.next())
+            X_batch, transitions_batch, y_batch, num_transitions_batch, train_ids = batch
 
-        total_tokens = sum([(nt+1)/2 for nt in num_transitions_batch.reshape(-1)])
+            total_tokens = sum([(nt+1)/2 for nt in num_transitions_batch.reshape(-1)])
 
-        # Reset cached gradients.
-        optimizer.zero_grad()
+            # Reset cached gradients.
+            optimizer.zero_grad()
 
-        # Run model.
-        output = model(X_batch, transitions_batch, y_batch,
-            use_internal_parser=FLAGS.use_internal_parser,
-            validate_transitions=FLAGS.validate_transitions
-            )
+            with Timer("model"):
+                # Run model.
+                output = model(X_batch, transitions_batch, y_batch,
+                    use_internal_parser=FLAGS.use_internal_parser,
+                    validate_transitions=FLAGS.validate_transitions
+                    )
 
-        # Normalize output.
-        logits = F.log_softmax(output)
+            with Timer("dist"):
+                # Normalize output.
+                logits = F.log_softmax(output)
 
-        # Calculate class accuracy.
-        target = torch.from_numpy(y_batch).long()
-        pred = logits.data.max(1)[1].cpu() # get the index of the max log-probability
-        class_acc = pred.eq(target).sum() / float(target.size(0))
+                # Calculate class accuracy.
+                target = torch.from_numpy(y_batch).long()
+                pred = logits.data.max(1)[1].cpu() # get the index of the max log-probability
+                class_acc = pred.eq(target).sum() / float(target.size(0))
 
-        # Calculate class loss.
-        xent_loss = nn.NLLLoss()(logits, to_gpu(Variable(target, volatile=False)))
+            with Timer("loss"):
+                # Calculate class loss.
+                xent_loss = nn.NLLLoss()(logits, to_gpu(Variable(target, volatile=False)))
 
-        # Optionally calculate transition loss.
-        transition_loss = model.transition_loss if hasattr(model, 'transition_loss') else None
+                # Optionally calculate transition loss.
+                transition_loss = model.transition_loss if hasattr(model, 'transition_loss') else None
 
-        # Extract L2 Cost
-        l2_loss = l2_cost(model, FLAGS.l2_lambda) if FLAGS.use_l2_cost else None
+                with Timer("l2"):
+                    # Extract L2 Cost
+                    l2_loss = l2_cost(model, FLAGS.l2_lambda) if FLAGS.use_l2_cost else None
 
-        # Accumulate Total Loss Variable
-        total_loss = 0.0
-        total_loss += xent_loss
-        if l2_loss is not None:
-            total_loss += l2_loss
-        if transition_loss is not None and model.optimize_transition_loss:
-            total_loss += transition_loss
-        total_loss += auxiliary_loss(model)
+                with Timer("combine"):
+                    # Accumulate Total Loss Variable
+                    total_loss = 0.0
+                    total_loss += xent_loss
+                    if l2_loss is not None:
+                        total_loss += l2_loss
+                    if transition_loss is not None and model.optimize_transition_loss:
+                        total_loss += transition_loss
+                    with Timer("aux"):
+                        total_loss += auxiliary_loss(model)
 
-        # Backward pass.
-        total_loss.backward()
+            # Backward pass.
+            with Timer("backward"):
+                total_loss.backward()
 
-        # Hard Gradient Clipping
-        clip = FLAGS.clipping_max_value
-        for p in model.parameters():
-            if p.requires_grad:
-                p.grad.data.clamp_(min=-clip, max=clip)
+            # Hard Gradient Clipping
+            with Timer("clip"):
+                clip = FLAGS.clipping_max_value
+                for p in model.parameters():
+                    if p.requires_grad:
+                        p.grad.data.clamp_(min=-clip, max=clip)
 
-        # Learning Rate Decay
-        if FLAGS.actively_decay_learning_rate:
-            optimizer.lr = FLAGS.learning_rate * (FLAGS.learning_rate_decay_per_10k_steps ** (step / 10000.0))
+            # Learning Rate Decay
+            if FLAGS.actively_decay_learning_rate:
+                optimizer.lr = FLAGS.learning_rate * (FLAGS.learning_rate_decay_per_10k_steps ** (step / 10000.0))
 
-        # Gradient descent step.
-        optimizer.step()
+            with Timer("update"):
+                # Gradient descent step.
+                optimizer.step()
 
-        end = time.time()
+            end = time.time()
 
-        total_time = end - start
+            total_time = end - start
 
-        train_accumulate(model, data_manager, A, batch)
-        A.add('class_acc', class_acc)
-        A.add('total_tokens', total_tokens)
-        A.add('total_time', total_time)
+            with Timer("accumulate"):
+                train_accumulate(model, data_manager, A, batch)
+                A.add('class_acc', class_acc)
+                A.add('total_tokens', total_tokens)
+                A.add('total_time', total_time)
 
         if step % FLAGS.statistics_interval_steps == 0:
             progress_bar.step(i=FLAGS.statistics_interval_steps, total=FLAGS.statistics_interval_steps)
