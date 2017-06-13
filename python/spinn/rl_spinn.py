@@ -225,7 +225,9 @@ class BaseModel(_BaseModel):
 
     def reinforce(self, advantage):
         """
+        advantage = vector of size batch_size
         t_preds  = 200...111 (flattened predictions from sub_batches 1...N)
+                   |---example 1---|---example 2---|---and so on...
         t_mask   = 011...111 (binary mask, selecting non-skips only)
         t_logprobs = (B*N)xC (tensor of sub_batch_size * sub_num_batches x transition classes)
         a_index  = 011...(N-1)(N-1)(N-1) (masked sub_batch_indices for each transition)
@@ -241,6 +243,7 @@ class BaseModel(_BaseModel):
                                  for m in self.spinn.memories if 't_mask' in m])
         t_valid_mask = np.concatenate(
             [m['t_valid_mask'] for m in self.spinn.memories if 't_mask' in m])
+        # Contains available moves. Still connected via gradient to model params.
         t_logprobs = torch.cat(
             [m['t_logprobs'] for m in self.spinn.memories if 't_logprobs' in m], 0)
 
@@ -251,12 +254,20 @@ class BaseModel(_BaseModel):
 
         seq_length = t_preds.shape[0] / batch_size
 
-        a_index = np.arange(batch_size)
+        # Which advantage score corresponds to this prediction?
+        # Advantage is already masked.
+        a_index = np.arange(batch_size) # 012...B
         a_index = a_index.reshape(1, -1).repeat(seq_length, axis=0).flatten()
         a_index = torch.from_numpy(a_index[t_mask]).long()
 
+        # What positions in t_preds are important? (have >1 choice)
         t_index = to_gpu(Variable(torch.from_numpy(
             np.arange(t_mask.shape[0])[t_mask])).long())
+
+        # a_index and t_index must have the same size (len).
+        #   let's call this size K (stands for keep).
+        # a_index has values 0...B-1
+        # t_index has values 0...len(t_preds)
 
         self.stats = dict(
             mean=advantage.mean(),
@@ -267,15 +278,17 @@ class BaseModel(_BaseModel):
 
         if self.use_sentence_pair:
             # Handles the case of SNLI where each reward is used for two
-            # sentences.
+            # sentences. From B to 2B.
             advantage = torch.cat([advantage, advantage], 0)
 
-        # Expand advantage.
+        # Expand advantage. FT, K
         advantage = torch.index_select(advantage, 0, a_index)
 
-        # Filter logits.
+        # Filter logits. FT, K x C (num classes)
         t_logprobs = torch.index_select(t_logprobs, 0, t_index)
 
+        # What actions does RL end up taking, and what are their scores
+        # log_p_action is FT, K. Still in GPU.
         actions = to_gpu(Variable(torch.from_numpy(
             t_preds[t_mask]).long().view(-1, 1), volatile=not self.training))
         log_p_action = torch.gather(t_logprobs, 1, actions)

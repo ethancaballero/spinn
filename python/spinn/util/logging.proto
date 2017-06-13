@@ -56,10 +56,10 @@ message SpinnEntry {
   // RL log properties.
   optional float policy_cost = 11;
   optional float value_cost = 12;
-  optional float mean_adv_mean = 13;
-  optional float mean_adv_mean_magnitude = 14;
-  optional float mean_adv_var = 15;
-  optional float mean_adv_var_magnitude = 16;
+  optional float mean_adv_mean = 13; // E[advantage of minibatch]
+  optional float mean_adv_mean_magnitude = 14; // E[abs(advantage)]
+  optional float mean_adv_var = 15; // Var[advantage of minibatch]
+  optional float mean_adv_var_magnitude = 16; // Var[abs(advantage)]
   optional float epsilon = 17;
   optional float temperature = 18;
 

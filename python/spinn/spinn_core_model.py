@@ -627,6 +627,7 @@ class BaseModel(nn.Module):
                 use_internal_parser=False, validate_transitions=True, **kwargs):
         example = self.unwrap(sentences, transitions)
 
+        # Batch size, sequence length
         b, l = example.tokens.size()[:2]
 
         embeds = self.embed(example.tokens)
