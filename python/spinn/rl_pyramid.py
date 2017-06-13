@@ -93,8 +93,9 @@ class RLPyramid(nn.Module):
     def run_pyramid(self, x, show_sample=False):
         batch_size, seq_len, model_dim = x.data.size()
 
-        all_state_pairs = []
-        all_state_pairs.append(torch.chunk(x, seq_len, 1))
+        # Each item is a list of B x D phrase vectors for a given layer.
+        phrase_vectors = []
+        phrase_vectors.append(torch.chunk(x, seq_len, 1))
 
         # Temp fix:
         show_sample = False
@@ -102,55 +103,35 @@ class RLPyramid(nn.Module):
         if show_sample:
             print
 
-        # How many phrase vectors are needed? Suppose seq_len is S.
-        # - (S-1) for each pair of adjacent words.
-        # - On each update, need to compose 2 vectors. Suppose we merge words
-        #     a and a+1 into b. Then we need to get compositions of
-        #     a-1|b and b|a+2.
-
-        # There are two buffers/matrices: word buffer and candidate buffer.
-        #   word buffer contains word vectors and accepted compositions.
-        #   candidate buffer is the list of available steps
-        #   we also keep a 2-way linked list of left and right neighbors of
-        #     each *word*.
-
-        # Example 1:
-        #   seq_len = 20, meaning 20 vectors in the word buffer
-        #   there are 19 candidate compositions
-        #   suppose candidate 5 (compose w5 and w6) has highest score
-        #   precondition:
-        #      linked list: 0-...-4-5-6-7-...-19
-        #      
-        #   run the composition network, and add it to position 20
-        #   each vector i has a left neighbor left_ids[i] and right neighbor.
-        #   each vector is the result of composition of adjacent words.
-        #     add compositions of *word* 4 and vector 5 to index 20
-        #       left_ids[20] = 3, right_ids[20] = 7
-        #     add compositions of vector 5 and *word* 7 to index 21
-        #       left_ids[21] = 4, right_ids[21] = 8
-        #   invalidate (set to 0) the scores for indices:
-        #     4=(4,5) 5=(5,6) and 6=(6,7)
-        #   change the right neighbor of 4 and left neighbor of 7:
-        #     right_ids[4] = 
-
         #left_ids = range(seq_len - 1)
         #right_ids = [x+1 for x in left_ids]
         # TODO: fill in the rest of the faster model.
 
+        # composition_results across layers:
+        # | | | |_/ / /    choices: 0-5 len: 7
+        # | | | |__/ /              0-4 len: 6
+        # | |_/ / __/               0-3
+        # |_/ _/ /
+        # |__/ _/
+        # |___/
+        # |  -> output
+
         for layer in range(seq_len - 1, 0, -1):
+            # Composition_results need to be recalculated to support
+            # batching multiple examples together.
             composition_results = []
             selection_logits_list = []
 
             for position in range(layer):
-                left = torch.squeeze(all_state_pairs[-1][position])
-                right = torch.squeeze(all_state_pairs[-1][position + 1])
+                left = torch.squeeze(phrase_vectors[-1][position])
+                right = torch.squeeze(phrase_vectors[-1][position + 1])
                 composition_results.append(self.composition_fn(left, right))
 
-            # selection_logits: FT B x S
+            # selection_logits: FT B x len(comp_results)
             for position in range(layer):    
                 selection_logits_list.append(self.selection_fn(composition_results[position]))
             selection_logits = torch.cat(selection_logits_list, 1)
-            selection_probs = F.softmax(selection_logits) # FT, B x S
+            selection_probs = F.softmax(selection_logits) # FT, B x len(comp_results)
 
             if show_sample:
                 print sparks(np.transpose(selection_probs[0,:].data.cpu().numpy()).tolist())
@@ -163,32 +144,33 @@ class RLPyramid(nn.Module):
                 selection_probs *= Variable(noise)
 
             # RL happens here. Change selection_probs to a hard decision on
-            # which one to compose.
-            # TODO: fill
+            # which one to compose. Remember logits and selections.
+            # TODO: implement
+            selected = tensor # LT, B
 
             layer_state_pairs = [] # State of sentence in the next step
             for position in range(layer):
-                if position < (layer - 1):
-                    copy_left = torch.sum(selection_probs[:, position + 1:], 1)
-                else:
-                    copy_left = to_gpu(Variable(torch.zeros(1, 1)))
-                if position > 0:
-                    copy_right = torch.sum(selection_probs[:, :position], 1)
-                else: 
-                    copy_right = to_gpu(Variable(torch.zeros(1, 1)))
-                select = selection_probs[:, position]
+                # copy_left: if choose 5+6, copy 0-4
+                # copy_left: if choose 5+6, copy 7-S
+                copy_left = position.lt(selected)
+                copy_right = position.gt(selected + 1)
+                select = (1 - copy_left) * (1 - copy_right)
+                # These three are mutually exclusive.
+                # Assert: copy_left + copy_right + select = 1 everywhere
+                # Assert: copy_left, copy_right, select >= 0
 
-                left = torch.squeeze(all_state_pairs[-1][position])
-                right = torch.squeeze(all_state_pairs[-1][position + 1])
+                left = torch.squeeze(phrase_vectors[-1][position])
+                right = torch.squeeze(phrase_vectors[-1][position + 1])
                 composition_result = composition_results[position]
                 new_state_pair = copy_left.expand_as(left) * left \
                     + copy_right.expand_as(right) * right \
                     + select.unsqueeze(1).expand_as(composition_result) * composition_result
                 layer_state_pairs.append(new_state_pair)
 
-            all_state_pairs.append(layer_state_pairs)
+            phrase_vectors.append(layer_state_pairs)
 
-        return all_state_pairs[-1][-1]
+        # TODO: return choices too
+        return phrase_vectors[-1][-1]
 
     def run_embed(self, x):
         batch_size, seq_length = x.size()
