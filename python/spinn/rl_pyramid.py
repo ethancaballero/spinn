@@ -79,8 +79,6 @@ class RLPyramid(nn.Module):
                                              composition_ln=False)
         self.selection_fn = Linear(initializer=HeKaimingInitializer)(model_dim, 1)
 
-        # TODO: Set up layer norm.
-
         mlp_input_dim = model_dim * 2 if use_sentence_pair else model_dim
 
         self.mlp = MLP(mlp_input_dim, mlp_dim, num_classes,
@@ -117,7 +115,8 @@ class RLPyramid(nn.Module):
         # |___/
         # |  -> output
 
-        self.last_run_selections = []
+        selections = []
+        selection_logits_per_layer = []
         for layer in range(seq_len - 1, 0, -1):
             # Composition_results need to be recalculated to support
             # batching multiple examples together.
@@ -132,8 +131,8 @@ class RLPyramid(nn.Module):
             # selection_logits: FT B x len(comp_results)
             for position in range(layer):    
                 selection_logits_list.append(self.selection_fn(composition_results[position]))
-            selection_logits = torch.cat(selection_logits_list, 1)
-            selection_probs = F.softmax(selection_logits) # FT, B x len(comp_results)
+            selection_logits = F.log_softmax(torch.cat(selection_logits_list, 1))
+            selection_probs = selection_logits.exp() # FT, B x len(comp_results)
 
             if show_sample:
                 print sparks(np.transpose(selection_probs[0,:].data.cpu().numpy()).tolist())
@@ -147,6 +146,7 @@ class RLPyramid(nn.Module):
 
             # RL happens here. Change selection_probs to a hard decision on
             # which one to compose. Remember logits and selections.
+            selection_logits_per_layer.append(selection_logits)
             selection_probs_data = selection_probs.data
             if training:
                 selected_data = torch.multinomial(selection_probs_data, 1)
@@ -177,7 +177,7 @@ class RLPyramid(nn.Module):
             phrase_vectors.append(layer_state_pairs)
 
         # TODO: return choices too
-        return phrase_vectors[-1][-1]
+        return phrase_vectors[-1][-1], selections, selection_logits_per_layer
 
     def run_embed(self, x):
         batch_size, seq_length = x.size()
@@ -196,7 +196,8 @@ class RLPyramid(nn.Module):
     def prep_and_run_pyramid(self, sentences, transitions, training=None):
         x = self.unwrap(sentences, transitions) # LT, B x S
         emb = self.run_embed(x)
-        hh = self.run_pyramid(emb, show_sample, training=training) # FT, B x D
+        hh, selections, logits = self.run_pyramid(
+                emb, show_sample, training=training) # FT, B x D
         h = self.wrap(hh)
         output = self.mlp(h)
 
@@ -206,8 +207,23 @@ class RLPyramid(nn.Module):
             'emb': emb,
             'pyramid_output': hh,
             'mlp_input': h,
-            'output_classes': output
+            'output_classes': output,
+            'selections': selections,
+            'selection_logits': logits # can update model params
         }
+
+    def reinforce(self, advantage, data):
+        '''data is the dictionary defined above by prep_and_run'''
+        logits = data['selection_logits'] # already normalized
+        scores = [torch.gather(logit, 1, action) 
+                for logit, action in zip(logits, data['selections'])] # B x 1 each
+        log_p_action = torch.cat(scores, 1) # FT, B x S matrix
+        neg_policy_losses = log_p_action * advantage
+        policy_loss = -1. * torch.sum(neg_policy_losses)
+        policy_loss /= log_p_action.size(0) # Average policy loss (neg advantage)
+
+        # TODO: entropy and weight
+        return policy_loss
 
     def forward(self, sentences, transitions=None, y_batch=None, show_sample=False):
         '''
@@ -218,8 +234,11 @@ class RLPyramid(nn.Module):
         # Useful when investigating dynamic batching:
         # self.seq_lengths = sentences.shape[1] - (sentences == 0).sum(1)
 
-        probs = self.prep_and_run_pyramid(sentences, transitions)
-        baseline_probs = self.prep_and_run_pyramid(sentences, transitions, training=False)
+        probs, data = \
+                self.prep_and_run_pyramid(sentences, transitions)
+        # Use greedy-max.
+        baseline_probs, baseline_data = \
+                self.prep_and_run_pyramid(sentences, transitions, training=False)
         target = torch.from_numpy(y_batch).long() # LT, B x 1
 
         # Get Reward.
