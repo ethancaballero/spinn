@@ -90,7 +90,12 @@ class RLPyramid(nn.Module):
         self.reshape_input = context_args.reshape_input
         self.reshape_context = context_args.reshape_context
 
-    def run_pyramid(self, x, show_sample=False):
+        self.last_run_selections = []
+
+    def run_pyramid(self, x, show_sample=False, training=None):
+        if training is None:
+            training = self.training
+
         batch_size, seq_len, model_dim = x.data.size()
 
         # Each item is a list of B x D phrase vectors for a given layer.
@@ -103,10 +108,6 @@ class RLPyramid(nn.Module):
         if show_sample:
             print
 
-        #left_ids = range(seq_len - 1)
-        #right_ids = [x+1 for x in left_ids]
-        # TODO: fill in the rest of the faster model.
-
         # composition_results across layers:
         # | | | |_/ / /    choices: 0-5 len: 7
         # | | | |__/ /              0-4 len: 6
@@ -116,6 +117,7 @@ class RLPyramid(nn.Module):
         # |___/
         # |  -> output
 
+        self.last_run_selections = []
         for layer in range(seq_len - 1, 0, -1):
             # Composition_results need to be recalculated to support
             # batching multiple examples together.
@@ -137,7 +139,7 @@ class RLPyramid(nn.Module):
                 print sparks(np.transpose(selection_probs[0,:].data.cpu().numpy()).tolist())
 
             # "dropout" some candidate selections.
-            if self.training and self.selection_keep_rate is not None:
+            if training and self.selection_keep_rate is not None:
                 # 0 = drop, 1 = keep
                 keep_prob = to_gpu(torch.ones(1, 1)) * self.selection_keep_rate
                 noise = torch.bernoulli(keep_prob.expand_as(selection_logits))
@@ -145,8 +147,13 @@ class RLPyramid(nn.Module):
 
             # RL happens here. Change selection_probs to a hard decision on
             # which one to compose. Remember logits and selections.
-            # TODO: implement
-            selected = tensor # LT, B
+            selection_probs_data = selection_probs.data
+            if training:
+                selected_data = torch.multinomial(selection_probs_data, 1)
+            else:
+                selected_data = selection_probs_data.max()[1] # arg max of transitions
+            selected = Variable(selected_data) # LT, B
+            self.last_run_selections.append(selected)
 
             layer_state_pairs = [] # State of sentence in the next step
             for position in range(layer):
@@ -186,6 +193,22 @@ class RLPyramid(nn.Module):
 
         return embeds
 
+    def prep_and_run_pyramid(self, sentences, transitions, training=None):
+        x = self.unwrap(sentences, transitions) # LT, B x S
+        emb = self.run_embed(x)
+        hh = self.run_pyramid(emb, show_sample, training=training) # FT, B x D
+        h = self.wrap(hh)
+        output = self.mlp(h)
+
+        probs = F.softmax(output).data.cpu() # FT, B x V
+        return probs, {
+            'x': x,
+            'emb': emb,
+            'pyramid_output': hh,
+            'mlp_input': h,
+            'output_classes': output
+        }
+
     def forward(self, sentences, transitions=None, y_batch=None, show_sample=False):
         '''
         sentences: Tensor
@@ -195,19 +218,14 @@ class RLPyramid(nn.Module):
         # Useful when investigating dynamic batching:
         # self.seq_lengths = sentences.shape[1] - (sentences == 0).sum(1)
 
-        x = self.unwrap(sentences, transitions) # LT, B x S
-        emb = self.run_embed(x)
-        hh = self.run_pyramid(emb, show_sample)
-        h = self.wrap(hh)
-        output = self.mlp(h)
-
-        probs = F.softmax(output).data.cpu() # FT, B x V
+        probs = self.prep_and_run_pyramid(sentences, transitions)
+        baseline_probs = self.prep_and_run_pyramid(sentences, transitions, training=False)
         target = torch.from_numpy(y_batch).long() # LT, B x 1
 
         # Get Reward.
         rewards = self.build_reward(probs, target) # FT, B x 1
-        baseline = self.build_baseline(rewards, sentences, transitions, y_batch)
-        advantage = self.advantage(rewards, baseline) # FT, B x 1
+        baseline = self.build_reward(baseline_probs, target) # FT, B x 1
+        advantage = rewards - baseline
         policy_loss = self.reinforce(advantage)
 
         return output
